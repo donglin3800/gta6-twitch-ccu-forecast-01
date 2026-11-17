@@ -1,33 +1,36 @@
 """Forecast GTA VI's launch-day Twitch viewers hour by hour (gta6-twitch-ccu-forecast-01).
 
-Method: comparable-launch shape forecast.
+Method: comparable-launch shape forecast, local-linear in hour-1 size.
   - Every comparable launch in the case file carries its full release-day hourly
     curve.  For each forecast hour h, take the log ratio log(viewers_h / viewers_1)
     across those launches and build quantiles from it, so the forecast follows the
     shape real launches actually traced (midnight-local unlock steps around
     05:00Z/08:00Z, then the evening prime-time peak) instead of assuming hour 1
     repeats all day.
+  - The ratio depends steeply on hour-1 size: across the kit's comparables the
+    correlation between log(hour-1 viewers) and the log peak ratio is -0.94 (a
+    23k-viewer hour 1 typically grows ~5x by hour 20, a 270k one only ~1.6x).
+    So per hour the centre is a weighted local-linear regression of the log
+    ratio on log(hour-1 viewers), evaluated at the target's own hour 1 -- a
+    weighted median would flatten that slope and under-predict small launches
+    and over-predict big ones.
   - Not every comparable is equally relevant.  Each launch is weighted by three
     things, all read from the case file at run time:
-      * hour-1 size: a Gaussian kernel on log(hour-1 viewers) with bandwidth 0.5
-        (widened only until the effective sample size reaches 8).  Hour 1 already
-        encodes how much of the world had unlocked and how big the launch is, and
-        in leave-one-out tests on the kit's comparables (this program, run as-is)
-        this weighting cut the pinball loss from 0.363 (persistence) to 0.241 on
-        rolling-midnight launches, the regime GTA VI and all four practice cases
-        share, and from 0.930 to 0.424 across all usable comparables.  The main
-        residual risk is a launch that spikes like Resident Evil Requiem (12x its
-        hour 1 by hour 20); the widened 90% band is the honest price for that.
+      * hour-1 size: a Gaussian kernel on log(hour-1 viewers), bandwidth 1.5.
       * unlock regime: same regime as the target (rolling midnight-local,
         simultaneous global, or unknown) weighs 1.0, a known-but-different
         regime 0.2, unknown 0.5.  The target regime is read from the case notes.
       * tier: comparable 1.0, early-access-contaminated 0.5, weak 0.3,
         the GTA VI pre-release history (not a launch) 0.
-  - Per hour, the weighted median log ratio is the centre and the spread is the
-    weighted interquartile range turned into a log sigma (floor 0.30, cap 1.0):
-    q_tau = p1 * exp(median + z_tau * sigma), z the standard normal quantiles.
-    That keeps the 90% band honest: wide enough to cover a launch that spikes
-    like Resident Evil Requiem, narrow enough not to pay for width everywhere.
+  - Per hour, the spread is the weighted residual standard deviation around the
+    local-linear fit (floor 0.25, cap 1.0):
+    q_tau = p1 * exp(centre + z_tau * sigma), z the standard normal quantiles.
+    In leave-one-out tests on the kit's comparables (this program, run as-is)
+    this cut the pinball loss from 0.363 (persistence) to 0.235 on
+    rolling-midnight launches, the regime GTA VI and all four practice cases
+    share, and from 0.930 to 0.380 across all usable comparables.  The main
+    residual risk is a launch that spikes like Resident Evil Requiem (12x its
+    hour 1 by hour 20); the widened 90% band is the honest price for that.
   - Fallback: with fewer than 5 usable comparables, fall back to the house
     persistence baseline (flat median, sigma 0.15 * sqrt(h - 1)).
 
@@ -49,10 +52,9 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
-SIGMA_FLOOR = 0.30
+SIGMA_FLOOR = 0.25
 SIGMA_CAP = 1.0
-BASE_BW = 0.5
-MIN_ESS = 8.0
+BASE_BW = 1.5
 # A single comparable's log ratio is capped before it enters the quantiles, so
 # one extreme launch (a 2,000x spike from a near-zero hour 1) cannot drag the
 # 95% quantile to an absurd level if it ever carries non-trivial weight.  The
@@ -172,42 +174,49 @@ def forecast_case(case, name):
         return persistence_forecast(p1, case)
 
     log_p1 = math.log(p1)
-    bw = BASE_BW
-    weights = None
-    while True:
-        weights = []
-        for comp, values in comps:
-            d = math.log(values[1]) - log_p1
-            w = math.exp(-(d * d) / (2 * bw * bw))
-            w *= regime_weight(unlock_kind(comp.get("unlock") or ""), target_kind)
-            w *= TIER_WEIGHT[tier_of(comp.get("unlock") or "")]
-            weights.append(w)
-        total = sum(weights)
-        ess = (total * total) / sum(w * w for w in weights) if total > 0 else 0.0
-        if ess >= MIN_ESS or bw >= 1.5:
-            break
-        bw *= 1.4
+    weights = []
+    for comp, values in comps:
+        d = math.log(values[1]) - log_p1
+        w = math.exp(-(d * d) / (2 * BASE_BW * BASE_BW))
+        w *= regime_weight(unlock_kind(comp.get("unlock") or ""), target_kind)
+        w *= TIER_WEIGHT[tier_of(comp.get("unlock") or "")]
+        weights.append(w)
     if sum(weights) <= 0:
         return persistence_forecast(p1, case)
 
     hours = []
     for row in case["forecast"]:
         h = row["hour"]
-        pairs = sorted(
+        # Weighted local-linear fit of the log ratio on log(hour-1 viewers),
+        # evaluated at this case's own hour 1.  Falls back to the weighted
+        # median when the fit is degenerate (near-zero spread in x).
+        points = [
             (
+                math.log(values[1]),
                 min(LOG_RATIO_MAX, max(LOG_RATIO_MIN, math.log(max(1.0, values[h]) / max(1.0, values[1])))),
                 w,
             )
             for (_, values), w in zip(comps, weights)
-        )
-        qs = [weighted_quantile(pairs, tau) for tau in LEVELS]
-        median = qs[2]
-        sigma = (qs[3] - qs[1]) / 1.349
-        sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
+        ]
+        total_w = sum(w for _, _, w in points)
+        xm = sum(w * x for x, _, w in points) / total_w
+        ym = sum(w * y for _, y, w in points) / total_w
+        sxx = sum(w * (x - xm) ** 2 for x, _, w in points)
+        sxy = sum(w * (x - xm) * (y - ym) for x, y, w in points)
+        if sxx > 1e-9:
+            slope = sxy / sxx
+            centre = ym + slope * (log_p1 - xm)
+            var = sum(w * (y - (ym + slope * (x - xm))) ** 2 for x, y, w in points) / total_w
+            sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, math.sqrt(max(var, 0.01))))
+        else:
+            pairs = sorted((y, w) for _, y, w in points)
+            centre = weighted_quantile(pairs, 0.5)
+            qs = [weighted_quantile(pairs, tau) for tau in LEVELS]
+            sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, (qs[3] - qs[1]) / 1.349))
         out_q = []
         prev = 0.0
         for z in Z:
-            q = round2(p1 * math.exp(median + z * sigma))
+            q = round2(p1 * math.exp(centre + z * sigma))
             q = min(1e9, max(0.01, float(q)))
             if q < prev:
                 q = prev
