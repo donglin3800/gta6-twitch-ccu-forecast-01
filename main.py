@@ -53,6 +53,14 @@ SIGMA_FLOOR = 0.30
 SIGMA_CAP = 1.0
 BASE_BW = 0.5
 MIN_ESS = 8.0
+# A single comparable's log ratio is capped before it enters the quantiles, so
+# one extreme launch (a 2,000x spike from a near-zero hour 1) cannot drag the
+# 95% quantile to an absurd level if it ever carries non-trivial weight.  The
+# cap binds at ratios of 0.05x and ~1,100x, far outside anything a
+# rolling-midnight launch traces (the largest in the kit is ~12x), so it does
+# not change the rolling-midnight forecast at all.
+LOG_RATIO_MIN = -3.0
+LOG_RATIO_MAX = 7.0
 
 
 def round2(x):
@@ -186,7 +194,10 @@ def forecast_case(case, name):
     for row in case["forecast"]:
         h = row["hour"]
         pairs = sorted(
-            (math.log(max(1.0, values[h]) / max(1.0, values[1])), w)
+            (
+                min(LOG_RATIO_MAX, max(LOG_RATIO_MIN, math.log(max(1.0, values[h]) / max(1.0, values[1])))),
+                w,
+            )
             for (_, values), w in zip(comps, weights)
         )
         qs = [weighted_quantile(pairs, tau) for tau in LEVELS]
